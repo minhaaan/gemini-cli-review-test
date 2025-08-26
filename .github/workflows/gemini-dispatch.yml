@@ -6,13 +6,9 @@ on:
       - 'created'
 
   pull_request_review:
-    types:
-      - 'submitted'
-      - 'synchronized'
+    types: [created]
   pull_request:
-    types:
-      - 'opened'
-      - 'synchronized'
+    types: [opened, synchronize, edited, reopened, ready_for_review]
   issues:
     types:
       - 'opened'
