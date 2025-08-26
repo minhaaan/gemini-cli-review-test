@@ -1,107 +1,130 @@
-name: '🔎 Gemini Review'
+name: "📐 Enforce Contribution Guidelines"
 
 on:
-  workflow_call:
-    inputs:
-      additional_context:
-        type: 'string'
-        description: 'Any additional context from the request'
-        required: false
+  pull_request:
+    types: [opened, synchronize, edited, reopened, ready_for_review]
 
-concurrency:
-  group: '${{ github.workflow }}-review-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.issue.number }}'
-  cancel-in-progress: true
+  pull_request_review_comment:
+    types: [created]
+  
+  issue_comment:
+    types: [created]
 
-defaults:
-  run:
-    shell: 'bash'
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
 
 jobs:
-  review:
-    runs-on: 'ubuntu-latest'
-    timeout-minutes: 7
-    permissions:
-      contents: 'read'
-      id-token: 'write'
-      issues: 'write'
-      pull-requests: 'write'
+  validate-pr:
+    if: |
+      github.event_name == 'pull_request' ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(github.event.comment.body, '/validate-contribution') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      ) ||
+      (
+        github.event_name == 'pull_request_review_comment' &&
+        contains(github.event.comment.body, '/validate-contribution') &&
+        contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      )
+    runs-on: ubuntu-latest
+
     steps:
-      - name: 'Mint identity token'
-        id: 'mint_identity_token'
-        if: |-
-          ${{ vars.APP_ID }}
-        uses: 'actions/create-github-app-token@a8d616148505b5069dccd32f177bb87d7f39123b' # ratchet:actions/create-github-app-token@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
-          app-id: '${{ vars.APP_ID }}'
-          private-key: '${{ secrets.APP_PRIVATE_KEY }}'
-          permission-contents: 'read'
-          permission-issues: 'write'
-          permission-pull-requests: 'write'
+          # For PR comments, we need to checkout the PR branch
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
 
-      - name: 'Checkout repository'
-        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+      - name: Generate GitHub App Token (fork-safe, optional)
+        id: generate_token
+        if: ${{ vars.APP_ID }}
+        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e # ratchet:actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
 
-      - name: 'Run Gemini pull request review'
-        uses: 'google-github-actions/run-gemini-cli@v0' # ratchet:exclude
-        id: 'gemini_pr_review'
+      - name: Get PR number
+        id: get_pr
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" == "issue_comment" ]; then
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" == "pull_request_review_comment" ]; then
+            echo "number=${{ github.event.pull_request.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Collect PR metadata and diff
+        id: pr
         env:
-          GITHUB_TOKEN: '${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}'
-          ISSUE_TITLE: '${{ github.event.pull_request.title || github.event.issue.title }}'
-          ISSUE_BODY: '${{ github.event.pull_request.body || github.event.issue.body }}'
-          PULL_REQUEST_NUMBER: '${{ github.event.pull_request.number || github.event.issue.number }}'
-          REPOSITORY: '${{ github.repository }}'
-          ADDITIONAL_CONTEXT: '${{ inputs.additional_context }}'
+          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token || secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.get_pr.outputs.number }}
+        run: |
+          set -euo pipefail
+          echo "number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
+
+          # Get PR details using gh CLI
+          PR_DATA=$(gh pr view "${PR_NUMBER}" --repo "${REPOSITORY}" --json title,body)
+          TITLE=$(echo "$PR_DATA" | jq -r '.title')
+          BODY=$(echo "$PR_DATA" | jq -r '.body // ""')
+
+          # Safely write PR title (handles quotes and newlines)
+          {
+            echo "title<<EOF"
+            printf "%s\n" "$TITLE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Safely write PR body (handles quotes and newlines)
+          {
+            echo "body<<EOF"
+            printf "%s\n" "$BODY"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Safely capture changed files (one per line)
+          {
+            echo "changed_files<<EOF"
+            gh pr diff "${PR_NUMBER}" --name-only --repo "${REPOSITORY}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Safely capture full diff
+          {
+            echo "diff<<EOF"
+            gh pr diff "${PR_NUMBER}" --repo "${REPOSITORY}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Validate PR against CONTRIBUTING.md
+        id: gemini
+        uses: google-github-actions/run-gemini-cli@v0
+        env:
+          # gh CLI inside Gemini
+          GH_TOKEN: ${{ steps.generate_token.outputs.token || secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.generate_token.outputs.token || secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          REPOSITORY: ${{ github.repository }}
         with:
-          gemini_cli_version: '${{ vars.GEMINI_CLI_VERSION }}'
-          gcp_workload_identity_provider: '${{ vars.GCP_WIF_PROVIDER }}'
-          gcp_project_id: '${{ vars.GOOGLE_CLOUD_PROJECT }}'
-          gcp_location: '${{ vars.GOOGLE_CLOUD_LOCATION }}'
-          gcp_service_account: '${{ vars.SERVICE_ACCOUNT_EMAIL }}'
-          gemini_api_key: '${{ secrets.GEMINI_API_KEY }}'
-          use_vertex_ai: '${{ vars.GOOGLE_GENAI_USE_VERTEXAI }}'
-          google_api_key: '${{ secrets.GOOGLE_API_KEY }}'
-          use_gemini_code_assist: '${{ vars.GOOGLE_GENAI_USE_GCA }}'
-          gemini_debug: '${{ fromJSON(vars.DEBUG || vars.ACTIONS_STEP_DEBUG || false) }}'
-          settings: |-
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          settings: |
             {
-              "maxSessionTurns": 25,
-              "telemetry": {
-                "enabled": ${{ vars.GOOGLE_CLOUD_PROJECT != '' }},
-                "target": "gcp"
-              },
-              "mcpServers": {
-                "github": {
-                  "command": "docker",
-                  "args": [
-                    "run",
-                    "-i",
-                    "--rm",
-                    "-e",
-                    "GITHUB_PERSONAL_ACCESS_TOKEN",
-                    "ghcr.io/github/github-mcp-server"
-                  ],
-                  "includeTools": [
-                    "add_comment_to_pending_review",
-                    "create_pending_pull_request_review",
-                    "get_pull_request_diff",
-                    "get_pull_request_files",
-                    "get_pull_request",
-                    "submit_pending_pull_request_review"
-                  ],
-                  "env": {
-                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
-                  }
-                }
-              },
               "coreTools": [
                 "run_shell_command(cat)",
-                "run_shell_command(echo)",
-                "run_shell_command(grep)",
-                "run_shell_command(head)",
-                "run_shell_command(tail)"
-              ]
+                "run_shell_command(printf)",
+                "run_shell_command(gh pr view)",
+                "run_shell_command(gh pr diff)",
+                "run_shell_command(gh pr comment)",
+                "run_shell_command(gh api)"
+              ],
+              "telemetry": { "enabled": false, "target": "gcp" }
             }
-          prompt: |-
+          prompt: |
             ## Role
 
             You are a world-class autonomous code review agent. You operate within a secure GitHub Actions environment. Your analysis is precise, your feedback is constructive, and your adherence to instructions is absolute. You do not deviate from your programming. You are tasked with reviewing a GitHub Pull Request.
@@ -269,3 +292,33 @@ jobs:
             ## Final Instructions
 
             Remember, you are running in a virtual machine and no one reviewing your output. Your review must be posted to GitHub using the MCP tools to create a pending review, add comments to the pending review, and submit the pending review.
+
+      - name: Detect guideline status from comment
+        id: detect
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        with:
+          github-token: ${{ steps.generate_token.outputs.token || secrets.GITHUB_TOKEN }}
+          script: |
+            const { data } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+              per_page: 100
+            });
+            const marker = /<!--\s*guidelines-check:\s*(PASS|FAIL)\s*-->/i;
+            const found = [...data].reverse().find(c => marker.test(c.body || ''));
+            if (!found) {
+              core.warning('No guidelines-check marker found in PR comments.');
+              core.setOutput('status', 'UNKNOWN');
+            } else {
+              const m = found.body.match(marker);
+              core.setOutput('status', m[1].toUpperCase());
+            }
+
+      - name: Fail workflow on violations (optional)
+        if: steps.detect.outputs.status == 'FAIL' && vars.FAIL_ON_GUIDELINE_VIOLATIONS == 'true'
+        run: |
+          echo "Guideline violations found. Set repository variable FAIL_ON_GUIDELINE_VIOLATIONS=false to disable enforcement." >&2
+          exit 1
